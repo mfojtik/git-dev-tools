@@ -42,7 +42,6 @@ func (r *Repository) Update() error {
 		return fmt.Errorf("Unable to merge commits from upstream (%v):\n%v", err, out)
 	}
 	return nil
-
 }
 
 func (r *Repository) Branches() []string {
@@ -95,11 +94,11 @@ func (r *Repository) Git(args ...string) (string, error) {
 	cmd.Stdout = &out
 
 	if err := cmd.Start(); err != nil {
-		return "", err
+		return out.String(), err
 	}
 
 	if err := cmd.Wait(); err != nil {
-		return "", err
+		return out.String(), err
 	}
 	return out.String(), nil
 }
@@ -150,7 +149,7 @@ func main() {
 			defer syncGroup.Done()
 			r := InitRepository(repoPath)
 			if err := r.Update(); err != nil {
-				log.Error("Repository '%v' failed to update: %v", err.Error())
+				log.Error("Repository '%v' failed to update: %v", r.Name(), err.Error())
 				return
 			} else {
 				log.Info("Repository '%v' successfully updated", r.Name())
