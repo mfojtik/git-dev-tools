@@ -2,107 +2,27 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/mfojtik/git-dev-tools/repository"
 	"github.com/op/go-logging"
 )
 
+const GitRepoFileName = ".gitrepos"
+
+// Setup logging
 var (
 	log    = logging.MustGetLogger("git-sync")
 	format = "%{color} ▶ %{level:.4s} %{color:reset} %{message}"
 )
 
-type Repository struct {
-	Path string
-}
-
-func InitRepository(path string) *Repository {
-	return &Repository{Path: filepath.Clean(path)}
-}
-
-func (r *Repository) Name() string {
-	return filepath.Base(r.Path)
-}
-
-func (r *Repository) Update() error {
-	if out, err := r.Git("checkout", "master"); err != nil {
-		return fmt.Errorf("Unable to checkout the master branch (%v):\n%v", err, out)
-	}
-	if out, err := r.Git("fetch", "upstream"); err != nil {
-		return fmt.Errorf("Unable to fetch commits from upstream (%v):\n%v", err, out)
-	}
-	if out, err := r.Git("merge", "upstream/master"); err != nil {
-		return fmt.Errorf("Unable to merge commits from upstream (%v):\n%v", err, out)
-	}
-	return nil
-}
-
-func (r *Repository) Branches() []string {
-	branches := []string{}
-	out, _ := r.Git("branch", "--no-color")
-	for _, name := range strings.Split(out, "\n") {
-		if len(strings.TrimSpace(name)) == 0 {
-			continue
-		}
-		branches = append(branches, strings.TrimSpace(strings.Replace(name, "*", "", -1)))
-	}
-	return branches
-}
-
-func (r *Repository) ListPushedLocalBranches() ([]string, error) {
-	defer func() {
-		r.Git("checkout", "master")
-	}()
-	branches := []string{}
-	for _, name := range r.Branches() {
-		if name == "master" {
-			continue
-		}
-		if _, err := r.Git("checkout", name); err != nil {
-			return branches, fmt.Errorf("Failed to checkout %s: %v", name, err)
-		}
-		if out, err := r.Git("cherry", "upstream/master"); len(out) == 0 && err == nil {
-			branches = append(branches, name)
-		}
-	}
-	return branches, nil
-}
-
-func (r *Repository) CleanBranch(name string) error {
-	if out, err := r.Git("branch", "-D", name); err != nil {
-		return fmt.Errorf("Unable to remove local branch '%s' (%v):\n%v", name, err, out)
-	}
-	if out, err := r.Git("push", "origin", ":"+name); err != nil {
-		return fmt.Errorf("Unable to remove remote branch 'origin/%s' (%v):\n%v", name, err, out)
-	}
-	return nil
-}
-
-func (r *Repository) Git(args ...string) (string, error) {
-	out := bytes.Buffer{}
-
-	cmd := exec.Command("git", args...)
-	cmd.Dir = r.Path
-	cmd.Stderr = &out
-	cmd.Stdout = &out
-
-	if err := cmd.Start(); err != nil {
-		return out.String(), err
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return out.String(), err
-	}
-	return out.String(), nil
-}
-
+// readGitReposFile reads the '.gitrepos' file which contains list of GIT
+// repositories we manage
 func readGitReposFile(path string) ([]string, error) {
 	gitDirectories := []string{}
 	file, err := os.Open(path + "/.gitrepos")
@@ -123,6 +43,17 @@ func readGitReposFile(path string) ([]string, error) {
 	return gitDirectories, nil
 }
 
+func reportChanges(r *repository.Repository) {
+	if len(r.Changes) == 0 {
+		return
+	}
+	fmt.Printf("Changes for %s\n\n", r.Name)
+	for _, c := range r.Changes {
+		fmt.Printf("%s (by %s)\n", c.Message, c.Author)
+	}
+	fmt.Println()
+}
+
 func main() {
 	logging.SetFormatter(logging.MustStringFormatter(format))
 	flag.Parse()
@@ -139,34 +70,40 @@ func main() {
 	}
 
 	var (
-		syncGroup  sync.WaitGroup
-		cleanGroup sync.WaitGroup
+		syncGroup    sync.WaitGroup
+		cleanGroup   sync.WaitGroup
+		repositories []*repository.Repository
 	)
 
+	// The main sync routine will do following:
+	// Step 1: Update the repository
+	// Step 2: Check if the repository contains branches that are already pushed
+	// Step 3: Remove these branches
 	for _, path := range repos {
 		syncGroup.Add(1)
 		go func(repoPath string) {
 			defer syncGroup.Done()
-			r := InitRepository(repoPath)
+			r := repository.NewRepository(repoPath)
 			if err := r.Update(); err != nil {
-				log.Error("Repository '%v' failed to update: %v", r.Name(), err.Error())
+				log.Error("Repository '%v' failed to update: %v", r.Name, err.Error())
 				return
 			} else {
-				log.Info("Repository '%v' successfully updated", r.Name())
+				log.Info("Repository '%v' successfully updated", r.Name)
+				repositories = append(repositories, r)
 			}
 			if cleanupBranches, err := r.ListPushedLocalBranches(); err != nil {
-				log.Error("Failed to get list of pushed branches for %s: %v", r.Name(), err.Error())
+				log.Error("Failed to get list of pushed branches for %s: %v", r.Name, err.Error())
 				return
 			} else {
 				if len(cleanupBranches) == 0 {
 					return
 				}
-				log.Info("Cleaning up %d branches for %s [%v]", len(cleanupBranches), r.Name(), cleanupBranches)
+				log.Info("Cleaning up %d branches for %s [%v]", len(cleanupBranches), r.Name, cleanupBranches)
 				for _, name := range cleanupBranches {
 					cleanGroup.Add(1)
-					go func(branchName string, repo *Repository) {
+					go func(branchName string, repo *repository.Repository) {
 						if err := repo.CleanBranch(branchName); err != nil {
-							log.Error("Failed to cleanup '%s' branch in '%s' repository: %v", branchName, repo.Name(), err.Error())
+							log.Error("Failed to cleanup '%s' branch in '%s' repository: %v", branchName, repo.Name, err.Error())
 						}
 					}(name, r)
 				}
@@ -177,4 +114,8 @@ func main() {
 	cleanGroup.Wait()
 	syncGroup.Wait()
 
+	// After all operations completed, report all changes...
+	for _, r := range repositories {
+		reportChanges(r)
+	}
 }
